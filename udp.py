@@ -22,6 +22,9 @@ class UdpBase(socket.socket):
         else:
             return self.sendto(data, addr)
 
+    def __del__(self):
+        self.close()
+
 class UdpGateway(TransparentGateway, UdpBase):
     def __init__(self, port, mqttHost="localhost", mqttPort=1883):
         UdpBase.__init__(self, port=port, bind=True)
@@ -31,3 +34,7 @@ class UdpClient(Client, UdpBase):
     def __init__(self, clientId, host, port):
         UdpBase.__init__(self, port=port, host=host)
         Client.__init__(self, clientId=clientId)
+
+    def __del__(self):
+        Client.__del__(self)
+        UdpBase.__del__(self)

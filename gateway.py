@@ -6,18 +6,18 @@ import logging
 
 import paho.mqtt.client as mqtt
 
-class GatewayClient(mqtt.Client):
+class TransparentGatewayClient(mqtt.Client):
     def __init__(self, clientId, addr, mqttHost, mqttPort, gateway):
+        mqtt.Client.__init__(self)
         self.clientId = clientId
         self.addr = addr
         self.subscriptions = SubscriptionList()
         self.topicTable = TopicTable()
         self.nextTopicId = 1
-        self.mqttClient = mqtt.Client()
-        self.mqttClient.on_connect = self.mqttOnConnect
-        self.mqttClient.on_message = self.mqttOnMessage
-        self.mqttClient.loop_start()
-        self.mqttClient.connect(mqttHost, mqttPort)
+        self.on_connect = self.mqttOnConnect
+        self.on_message = self.mqttOnMessage
+        self.loop_start()
+        self.connect(mqttHost, mqttPort)
         self.gateway = gateway
 
     def mqttOnConnect(self, client, userdata, flags, rc):
@@ -33,7 +33,13 @@ class GatewayClient(mqtt.Client):
                 m = MessageRegister(topicName=msg.topic, msgId=Message.newMessageId(), topicId=topicId)
                 m.addr = self.addr
                 self.gateway._write(m)
-            m = MessagePublish(msgId=Message.newMessageId(), topicId=topicId, data=msg.payload, retain=msg.retain, qos=msg.qos)
+
+            m = MessagePublish(
+                msgId=Message.newMessageId(),
+                topicId=topicId,
+                data=msg.payload,
+                retain=msg.retain,
+                qos=msg.qos)
             m.addr = self.addr
             self.gateway._write(m)
         except Exception as e:
@@ -55,19 +61,23 @@ class GatewayClient(mqtt.Client):
             MessageUnsubscribe: self.onUnsubscribe,
             MessagePingReq: self.onPingReq,
         }.get(type(m))
-
-        return callback(m)
+        if callback is not None:
+            return callback(m)
+        return None
 
     def onRegister(self, m):
         if not m.topicName in self.topicTable.topics:
             self.topicTable.add(m.topicName)
-        return MessageRegAck(msgId=m.msgId, returnCode=0, topicId=self.topicTable.getTopicId(m.topicName))
+        return MessageRegAck(
+            msgId=m.msgId,
+            returnCode=0, 
+            topicId=self.topicTable.getTopicId(m.topicName))
 
     def onPublish(self, m):
         topic = self.topicTable.getTopic(m.topicId)
         if topic is None:
             return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=2)
-        info = self.mqttClient.publish(topic=topic, payload=m.data, qos=m.flags.qos, retain=m.flags.retain)
+        info = self.publish(topic=topic, payload=m.data, qos=m.flags.qos, retain=m.flags.retain)
         if m.flags.qos !=0:
             info.wait_for_publish()
             return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=info.rc)
@@ -76,13 +86,13 @@ class GatewayClient(mqtt.Client):
         #Unknown topic
         if not m.topic in self.topicTable.topics:
             self.topicTable.add(m.topic)
-        result, mid = self.mqttClient.subscribe(m.topic, m.flags.qos)
+        result, mid = self.subscribe(m.topic, m.flags.qos)
         topicId = self.topicTable.getTopicId(m.topic)
 
         return MessageSubAck(msgId=m.msgId, topicId=topicId, returnCode=result, qos=0)
 
     def onUnsubscribe(self, m):
-        result, mid = self.mqttClient.unsubscribe(m.topic)
+        result, mid = self.unsubscribe(m.topic)
         return MessageUnsubAck(msgId=m.msgId)
 
     def onPingReq(self, m):
@@ -90,15 +100,15 @@ class GatewayClient(mqtt.Client):
 
 class TransparentGateway:
     def __init__(self, host="localhost", port=1883):
-        self.clientList = {}
+        self.clients = {}
         self._stopEvent = Event()
         self.mqttHost = host
         self.mqttPort = port
 
     def dump(self):
         print("Client list:")
-        for addr in self.clientList:
-            print("  {}: {}".format(addr, self.clientList[addr]))
+        for addr in self.clients:
+            print("  {}: {}".format(addr, self.clients[addr]))
 
     def _read(self):
         data, addr = self.read_packet()
@@ -122,7 +132,7 @@ class TransparentGateway:
                 elif type(msg) is MessageDisconnect:
                     reply = self.onDisconnect(msg)
                 else:
-                    client = self.clientList.get(msg.addr)
+                    client = self.clients.get(msg.addr)
                     reply = client.handle_packet(msg)
                 if reply is not None:
                     reply.addr = msg.addr
@@ -136,11 +146,17 @@ class TransparentGateway:
         self._stopEvent.set()
 
     def onConnect(self, m):
-        if not m.addr in self.clientList:
-            self.clientList[m.addr] = GatewayClient(m.clientId, m.addr, self.mqttHost, self.mqttPort, gateway=self)
+        if not m.addr in self.clients:
+            self.clients[m.addr] = TransparentGatewayClient(
+                m.clientId, 
+                m.addr, 
+                self.mqttHost, 
+                self.mqttPort, 
+                gateway=self)
         else:
             raise KeyError("DuplicateConnect")
         return MessageConnAck(0)
 
     def onDisconnect(self, m):
-        pass
+        cl = self.clients.pop(m.addr)
+        cl.disconnect()
