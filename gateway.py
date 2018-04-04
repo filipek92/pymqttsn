@@ -5,23 +5,23 @@ from threading import Event
 import logging
 
 import paho.mqtt.client as mqtt
+import socket
 
 class TransparentGatewayClient(mqtt.Client):
     def __init__(self, clientId, addr, mqttHost, mqttPort, gateway):
         mqtt.Client.__init__(self)
         self.clientId = clientId
         self.addr = addr
-        self.subscriptions = SubscriptionList()
         self.topicTable = TopicTable()
-        self.nextTopicId = 1
         self.on_connect = self.mqttOnConnect
         self.on_message = self.mqttOnMessage
+        self.on_disconnect = self.mqttOnDisConnect
         self.loop_start()
         self.connect(mqttHost, mqttPort)
         self.gateway = gateway
 
     def mqttOnConnect(self, client, userdata, flags, rc):
-        print("Connected to mqtt with result code "+str(rc))
+        print("Connected to mqtt for {} with rc={}".format(self.addr, rc))
 
     def mqttOnMessage(self, client, userdata, msg):
         try:
@@ -44,13 +44,15 @@ class TransparentGatewayClient(mqtt.Client):
             self.gateway._write(m)
         except Exception as e:
             logging.exception(e)
+    
+    def mqttOnDisConnect(self, client, userdata, rc):
+        print("Disconneted from mqtt for {} with rc={}".format(self.addr, rc))
 
     def __repr__(self):
         return "{}(clientId='{}', addr={})".format(
                 self.__class__.__name__,
                 self.clientId,
-                self.addr,
-                len(self.subscriptions)
+                self.addr
             )
 
     def handle_packet(self, m):
@@ -77,6 +79,10 @@ class TransparentGatewayClient(mqtt.Client):
         topic = self.topicTable.getTopic(m.topicId)
         if topic is None:
             return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=2)
+
+        if m.flags.qos > 0:
+            return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=3) # TODO Support QoS 1, 2
+
         info = self.publish(topic=topic, payload=m.data, qos=m.flags.qos, retain=m.flags.retain)
         if m.flags.qos !=0:
             info.wait_for_publish()
@@ -87,7 +93,10 @@ class TransparentGatewayClient(mqtt.Client):
         if not m.topic in self.topicTable.topics:
             self.topicTable.add(m.topic)
         result, mid = self.subscribe(m.topic, m.flags.qos)
-        topicId = self.topicTable.getTopicId(m.topic)
+        if ("+" in m.topic) or ("#" in m.topic): # Topic has wildcart
+            topicId = 0
+        else:
+            topicId = self.topicTable.getTopicId(m.topic)
 
         return MessageSubAck(msgId=m.msgId, topicId=topicId, returnCode=result, qos=0)
 
@@ -146,17 +155,33 @@ class TransparentGateway:
         self._stopEvent.set()
 
     def onConnect(self, m):
-        if not m.addr in self.clients:
-            self.clients[m.addr] = TransparentGatewayClient(
-                m.clientId, 
-                m.addr, 
-                self.mqttHost, 
-                self.mqttPort, 
-                gateway=self)
-        else:
-            raise KeyError("DuplicateConnect")
-        return MessageConnAck(0)
+        clean = m.flags.clean
+        will = m.flags.will
+
+        if clean:
+            self.onDisconnect(m)
+
+        try:
+            if not m.addr in self.clients:
+                self.clients[m.addr] = TransparentGatewayClient(
+                    m.clientId, 
+                    m.addr, 
+                    self.mqttHost, 
+                    self.mqttPort, 
+                    gateway=self)
+            else:
+                #Resend all topic maps
+                pass
+            return MessageConnAck(0)
+        except socket.gaierror as e:
+            logging.exception(e)
+            return MessageConnAck(3)
+        except Exception as e:
+            logging.exception(e)
+
+        return MessageConnAck(255)
 
     def onDisconnect(self, m):
-        cl = self.clients.pop(m.addr)
-        cl.disconnect()
+        if m.addr in self.clients:
+            cl = self.clients.pop(m.addr)
+            cl.disconnect()

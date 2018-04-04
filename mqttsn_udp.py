@@ -13,12 +13,11 @@ class UdpBase(socket.socket):
 
     def read_packet(self):
         data, addr = self.recvfrom(1024)
+        # print(data)
         return data, addr
 
-    def write_packet(self, data, addr=None, broadcast=False):
-        if broadcast:
-            print("Trying to bradcast")
-            return
+    def write_packet(self, data, addr=None):
+        # print(data)
         if addr is None:
             return self.sendto(data, (self.host, self.port))
         else:

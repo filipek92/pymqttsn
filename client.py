@@ -42,11 +42,28 @@ class Client(object):
     def handle_message(self, msg):
         if type(msg) == MessagePublish:
             msg.topic = self.topicTable.getTopic(msg.topicId)
-            self._on_message(msg)
+            # topic = self.topicTable.getTopic(m.topicId)
+            # if topic is None:
+            #     return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=2)
+
+            # if m.flags.qos > 0:
+            #     return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=3) # TODO Support QoS 1, 2
+
+            # info = self.publish(topic=topic, payload=m.data, qos=m.flags.qos, retain=m.flags.retain)
+            # if m.flags.qos !=0:
+            #     info.wait_for_publish()
+            #     return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=info.rc)
+
+            # self._on_message(msg)
 
         if type(msg) == MessageRegister:
             self.topicTable.add(topic=msg.topicName, id=msg.topicId)
             print("New topic registered", msg.topicName, msg.topicId)
+            s = MessageRegAck(
+                msgId=msg.msgId,
+                returnCode=0,
+                topicId=msg.topicId)
+            self._write(s)
 
     def connect(self, will=False, clean=None):
         if clean is None:
@@ -84,7 +101,9 @@ class Client(object):
         s = MessageSubscribe(topic=topic, qos=qos, topicType=0)
         self._write(s)
         r = self._read(waitfor=MessageSubAck, msgId=s.msgId)
-        return r.topicId
+        if r.topicId !=0:
+            self.topicTable.add(topic, r.topicId)
+            return r.topicId
 
     def unsubscribe(self, topic):
         s = MessageUnsubscribe(topic=topic, topicType=0)
