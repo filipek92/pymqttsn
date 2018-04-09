@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 
-from struct import pack, unpack
+from struct import pack as _pack
+from struct import unpack, error
 from itertools import chain
+from .exceptions import MqttsnError
+
+def pack(format, *args):
+    try:
+        return _pack(format, *args)
+    except error as e:
+        e.args = e.args[0]+" "+repr(args)+" format: "+format,
+        raise e
 
 def getTypeId(type):
     return {
-        # ADVERTISE:        0x00,
+        MessageAdvertise:   0x00,
         # SEARCHGW:     0x01,
         # GWINFO:           0x02,
         MessageConnect:     0x04,
@@ -35,6 +44,10 @@ def getTypeId(type):
     }.get(type)
 
 class Message:
+    NORMAL_TOPIC = 0b00
+    PREDEFINED_TOPIC = 0b01
+    SHORT_TOPIC = 0b10
+
     nextMessageId = 1;
 
     def __init__(self):
@@ -94,7 +107,20 @@ class Message:
         raise ValueError("Unknown message type")
 
 class MessageReq(Message):
-    pass
+    def __init__(self):
+        pass
+
+    @classmethod
+    def getReplyType(cls):
+        return {
+            MessageConnect: MessageConnAck,
+            MessageRegister: MessageRegAck,
+            MessagePublish: MessagePubAck,
+            MessageSubscribe: MessageSubAck,
+            MessageUnsubscribe: MessageUnsubAck,
+            MessagePingReq: MessagePingResp,
+            MessageDisconnect: MessageDisconnect
+        }.get(cls, None)
 
 class MessageAck(Message):
     pass
@@ -172,7 +198,7 @@ class Flags:
     @topicType.setter
     def topicType(self, value):
         self.setBit(0x03, False)
-        self.value |= topicType & 0x03
+        self.value |= value & 0x03
 
     def __int__(self):
         return self.value
@@ -189,10 +215,35 @@ class Flags:
             self.topicType
             )
 
+class MessageAdvertise(Message):
+    typeId = 0x00
+
+    def __init__(self, gwId=0, duration=None):
+        self.gwId = gwId
+        self.duration = duration
+
+    def pack(self):
+        return pack("=BH", self.gwId, self.duration)
+
+    @classmethod
+    def unpack(cls, binary):
+        m = cls()
+        m.gwId, m.duration = unpack("=BH", binary)  
+        return m
+
+    def __repr__(self):
+        if self.duration is None:
+            return "{}()".format(self.__class__.__name__)
+        else:
+            return "{}(duration='{}')".format(self.__class__.__name__, self.duration)
+
+        
+
 class MessageConnect(MessageReq):
     typeId = 0x04
 
     def __init__(self, clientId, will=False, clean=True, protocol=0x01, duration=0):
+        MessageReq.__init__(self)
         self.clientId = clientId
         self.flags = Flags(will=will, clean=clean)
         self.protocol = protocol
@@ -227,7 +278,7 @@ class MessageConnect(MessageReq):
 class MessageConnAck(MessageAck):
     typeId = 0x05
 
-    def __init__(self, returnCode):
+    def __init__(self, returnCode=0):
         self.returnCode = returnCode
 
     def pack(self):
@@ -238,12 +289,15 @@ class MessageConnAck(MessageAck):
         return cls(binary[0])
 
     def __repr__(self):
-        return "{}(returnCode={})".format(self.__class__.__name__, self.returnCode)
+        return "{}(returnCode={})".format(
+            self.__class__.__name__, 
+            "OK" if self.returnCode==0 else MqttsnError.fromReturnCode(self.returnCode).__name__)
 
 class MessageRegister(MessageReq):
     typeId = 0x0A
 
     def __init__(self, *, topicId=0x0000, msgId=None, topicName=None):
+        MessageReq.__init__(self)
         if msgId is None:
             msgId = self.newMessageId()
         self.topicId = topicId
@@ -270,7 +324,7 @@ class MessageRegister(MessageReq):
 class MessageRegAck(MessageAck):
     typeId = 0x0B
 
-    def __init__(self, *, msgId, topicId=0x0000, returnCode=0):
+    def __init__(self, *, msgId=0, topicId=0x0000, returnCode=0):
         self.topicId = topicId
         self.msgId = msgId & 0xFFFF
         self.returnCode = returnCode
@@ -280,7 +334,7 @@ class MessageRegAck(MessageAck):
 
     @classmethod
     def unpack(cls, binary):
-        m = cls(msgId=0)
+        m = cls()
         m.topicId, m.msgId, m.returnCode = unpack("=HHB", binary)
         return m
 
@@ -289,12 +343,13 @@ class MessageRegAck(MessageAck):
             self.__class__.__name__,
             self.topicId,
             self.msgId,
-            self.returnCode)
+            "OK" if self.returnCode==0 else MqttsnError.fromReturnCode(self.returnCode).__name__)
 
 class MessagePublish(MessageReq):
     typeId = 0x0C
 
     def __init__(self, *, dup=False, qos=0, retain=False, topicType=0, topicId=0, msgId=None, data=None):
+        MessageReq.__init__(self)
         if msgId is None:
             msgId = self.newMessageId()
         self.flags = Flags(dup=dup, qos=qos, retain=retain, topicType=topicType)
@@ -332,7 +387,7 @@ class MessagePublish(MessageReq):
         return m
 
     def __repr__(self):
-        return "{}(dup={}, qos={}, retain={}, topicType={}, topicId={}, msgId={}, len(data)={})".format(
+        return "{}(dup={}, qos={}, retain={}, topicType=0b{:02b}, topicId={}, msgId={}, len(data)={})".format(
             self.__class__.__name__,
             self.flags.dup,
             self.flags.qos,
@@ -345,7 +400,7 @@ class MessagePublish(MessageReq):
 class MessagePubAck(MessageAck):
     typeId = 0x0D
 
-    def __init__(self, *, msgId, topicId=0, returnCode=0):
+    def __init__(self, *, msgId=0, topicId=0, returnCode=0):
         self.topicId = topicId
         self.msgId = msgId & 0xFFFF
         self.returnCode = returnCode
@@ -355,7 +410,7 @@ class MessagePubAck(MessageAck):
 
     @classmethod
     def unpack(cls, binary):
-        m = cls(msgId=0)
+        m = cls()
         m.topicId, m.msgId, m.returnCode = unpack("=HHB", binary)
         return m
 
@@ -364,24 +419,27 @@ class MessagePubAck(MessageAck):
             self.__class__.__name__,
             self.topicId,
             self.msgId,
-            self.returnCode)
+            "OK" if self.returnCode==0 else MqttsnError.fromReturnCode(self.returnCode).__name__)
 
 class MessageSubscribe(MessageReq):
     typeId = 0x12
 
-    def __init__(self, *, qos=0, topicType=0, msgId=None, topic=None):
+    def __init__(self, *, qos=0, topicType=0b00, msgId=None, topic=None):
+        MessageReq.__init__(self)
         if msgId is None:
             msgId = self.newMessageId()
+
         self.flags = Flags(qos=qos, topicType=topicType)
-        self.msgId = msgId & 0xFFFF          
+        self.msgId = msgId & 0xFFFF
+
         if type(topic) is int:
             self.topic = topic
             assert(topicType != 0)
         elif type(topic) is str:
-            self.topicType = 0
+            self.flags.topicType = 0
             self.topic = topic
         elif topic is None:
-            self.topicType = 1;
+            self.flags.topicType = 1;
             self.topic = 0
         else:
             raise ValueError('Topic must be int or string')
@@ -406,7 +464,7 @@ class MessageSubscribe(MessageReq):
         return m
 
     def __repr__(self):
-        return "{}(qos={}, topicType={}, msgId={}, topic={})".format(
+        return "{}(qos={}, topicType=0b{:02b}, msgId={}, topic={})".format(
             self.__class__.__name__,
             self.flags.qos,
             self.flags.topicType,
@@ -416,18 +474,19 @@ class MessageSubscribe(MessageReq):
 class MessageSubAck(MessageAck):
     typeId = 0x13
 
-    def __init__(self, *, msgId, qos=0, topicId=0, returnCode=0):
+    def __init__(self, *, msgId=0, qos=0, topicId=0, returnCode=0):
         self.flags = Flags(qos=qos)
         self.topicId = topicId
         self.msgId = msgId & 0xFFFF
         self.returnCode = returnCode
 
     def pack(self):
+        print(int(self.flags), self.topicId, self.msgId & 0xFFFF, self.returnCode)
         return pack("=BHHB", int(self.flags), self.topicId, self.msgId & 0xFFFF, self.returnCode)
 
     @classmethod
     def unpack(cls, binary):
-        m = cls(msgId=0)
+        m = cls()
         m.topicId, m.msgId, m.returnCode = unpack("=xHHB", binary)
         m.flags = Flags(binary[0])
         return m
@@ -438,12 +497,13 @@ class MessageSubAck(MessageAck):
             self.flags.qos,
             self.topicId,
             self.msgId,
-            self.returnCode)
+            "OK" if self.returnCode==0 else MqttsnError.fromReturnCode(self.returnCode).__name__)
 
 class MessageUnsubscribe(MessageReq):
     typeId = 0x14
 
-    def __init__(self, *, msgId=None, topicType=1, topic=None):
+    def __init__(self, *, msgId=None, topicType=0b00, topic=None):
+        MessageReq.__init__(self)
         if msgId is None:
             msgId = self.newMessageId()
         self.flags = Flags(topicType=topicType)
@@ -482,7 +542,7 @@ class MessageUnsubscribe(MessageReq):
         return m
 
     def __repr__(self):
-        return "{}(topicType={}, msgId={}, topic={})".format(
+        return "{}(topicType=0b{:02b}, msgId={}, topic={})".format(
             self.__class__.__name__,
             self.flags.topicType,
             self.msgId,
@@ -512,6 +572,7 @@ class MessagePingReq(MessageReq):
     typeId = 0x16
 
     def __init__(self, clientId=None):
+        MessageReq.__init__(self)
         if clientId is None:
             clientId = bytes()
         self.clientId = clientId
@@ -551,6 +612,7 @@ class MessageDisconnect(MessageReq):
     typeId = 0x18
 
     def __init__(self, duration=None):
+        MessageReq.__init__(self)
         self.duration = duration
 
     def pack(self):

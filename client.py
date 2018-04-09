@@ -1,121 +1,157 @@
 from .messages import *
 from .exceptions import MqttsnError
-from .tools import TopicTable
+from .tools import TopicTable, WaitingList
+from threading import Thread, Event
 
-def onMessage(m):
-    print("New data on topic '{}': {}".format(m.topic, m.data))
+import logging
+logger = logging.getLogger(__name__)
 
-class Client(object):
-    def __init__(self, clientId):
+class Client():
+    T_RETRY = 10
+    N_RETRY = 5
+
+    def __init__(self, clientId, startThread=True):
         self.clientId = clientId
-        self.clean = True
         self.state = "Disconnected"
         self.topicTable = TopicTable()
-        self.onMessage = onMessage
+        self.onMessage = None
+        self.waitingList = WaitingList()
+        self.thread = None
+        self.stop_event = Event()
+        if startThread:
+            self.start()
 
-    def _on_message(self, m):
-        if self.onMessage:
-            self.onMessage(m)
-        else:
-            print(m)
+    def start(self):
+        if self.thread is None:
+            self.thread = Thread(target=self.loop, daemon=True)
+            self.thread.start()
 
-    def _write(self, m):
-        print("Write:", m)
-        return self.write_packet(bytes(m))
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join()
 
-    def _read(self, waitfor=None, msgId=None):
-        if waitfor is None:
-            data, addr = self.read_packet()
-            m = Message.fromBinary(data)
-            print("Read:", m)
-        else:
-            while True:
+    def loop(self):
+        while not self.stop_event.is_set():
+            try:
                 data, addr = self.read_packet()
-                m = Message.fromBinary(data)
-                print("Read:", m)
-                if (type(m) is waitfor) and ((msgId is None) or (msgId == m.msgId)):
-                    break
-                else:
-                    self.handle_message(m)
-        return m
+                msg = Message.fromBinary(data)
+                logger.debug("Read: {}".format(msg))
+                msgId = msg.msgId if hasattr(msg, "msgId") else None
+
+                ev = self.waitingList.get_waiting(addr, type(msg), msgId)
+                if ev:
+                    ev.setReply(msg)
+                    continue
+                self.handle_message(msg)
+            except Exception as e:
+                logging.exception(e)
+
+    def onPublish(self, msg):
+        msg.topic = self.topicTable.getTopic(msg.topicId)
+        # TODU Ask if unknown
+
+        # if topic is None:
+        #     return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=2)
+
+        if self.onMessage:
+            self.onMessage(msg)
+        else:
+            logger.info(msg)
+
+    def onRegister(self, msg):
+        self.topicTable.add(topic=msg.topicName, id=msg.topicId)
+        logger.info("New topic registered: {} ==> {}".format(msg.topicName, msg.topicId))
+        s = MessageRegAck(
+            msgId=msg.msgId,
+            returnCode=0,
+            topicId=msg.topicId)
+        self._write(s)
+
+    def _write_read(self, msg, retry=None):
+        we = self.waitingList.add_waiting(
+            address=self.server_addr,
+            waitfor=msg.getReplyType(), 
+            msgId=msg.msgId if hasattr(msg, "msgId") else None
+        )
+
+        retry = self.N_RETRY
+
+        while True:
+            self._write(msg)
+            if we.wait(timeout=self.T_RETRY):
+                return we.reply
+            if retry <= 0:
+                raise TimeoutError("Server not respond")
+            retry -= 1
+            if hasattr(msg, "flags"):
+                msg.flags.dup = True
+
+    def _write(self, msg):
+        logger.debug("Write: {}".format(msg))
+        return self.write_packet(bytes(msg))
 
     def handle_message(self, msg):
-        if type(msg) == MessagePublish:
-            msg.topic = self.topicTable.getTopic(msg.topicId)
-            # topic = self.topicTable.getTopic(m.topicId)
-            # if topic is None:
-            #     return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=2)
+        callback = {
+            MessagePublish: self.onPublish,
+            MessageRegister: self.onRegister
+        }.get(type(msg))
+        if callback:
+            callback(msg)
 
-            # if m.flags.qos > 0:
-            #     return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=3) # TODO Support QoS 1, 2
-
-            # info = self.publish(topic=topic, payload=m.data, qos=m.flags.qos, retain=m.flags.retain)
-            # if m.flags.qos !=0:
-            #     info.wait_for_publish()
-            #     return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=info.rc)
-
-            # self._on_message(msg)
-
-        if type(msg) == MessageRegister:
-            self.topicTable.add(topic=msg.topicName, id=msg.topicId)
-            print("New topic registered", msg.topicName, msg.topicId)
-            s = MessageRegAck(
-                msgId=msg.msgId,
-                returnCode=0,
-                topicId=msg.topicId)
-            self._write(s)
-
-    def connect(self, will=False, clean=None):
-        if clean is None:
-            clean = self.clean
+    def connect(self, will=False, clean=False):
         s = MessageConnect(self.clientId, will=will, clean=clean, duration=0)
-        self._write(s)
-        r = self._read(waitfor=MessageConnAck)
+        r = self._write_read(s)
         MqttsnError.raiseIfReturnCode(r.returnCode)
         self.state = "Connected"
 
     def register(self, topic):
         s = MessageRegister(topicName=topic)
-        self._write(s)
-        r = self._read(waitfor=MessageRegAck, msgId=s.msgId)
+        r = self._write_read(s)
         MqttsnError.raiseIfReturnCode(r.returnCode)
         self.topicTable.add(topic, r.topicId)
         return r.topicId
 
-    def publish(self, topic, data, retain=False, qos=0):
-        if type(topic) == int:
-            topicId = topic
-        elif type(topic) == str:
-            topicId = self.topicTable.getTopicId(topic)
-            if topicId is None:
-                topicId = self.register(topic)
+    def publish(self, topic, data, retain=False, qos=0, topicType=None):
+        if topicType is None or topicType == Message.NORMAL_TOPIC: # Normal topic (Registered topic ID)
+            if type(topic) == int:
+                topicId = topic
+            elif type(topic) == str:
+                topicId = self.topicTable.getTopicId(topic)
+                if topicId is None:
+                    topicId = self.register(topic)
+            else:
+                raise TypeError("Topic for topicType=0b00 must be str or int")
+        elif topicType == Message.PREDEFINED_TOPIC: # Predefined topic
+            raise NotImplementedError("Predefined topics are not implemented")
+        elif topicType == Message.SHORT_TOPIC: # Short topic
+            raise NotImplementedError("Short topics are not implemented")
         else:
-            raise TypeError("Topic must be str or int")
+            raise RuntimeError("Topic type must be 0b00, 0b01, 0b10 or None")
+
         s = MessagePublish(topicId=topicId, data=data, retain=retain, qos=qos)
-        self._write(s)
-        if qos !=0:
-            r = self._read(waitfor=MessagePubAck, msgId=s.msgId)
+        if qos == 0:
+            self._write(s)
+        else:
+            r = self._write_read(s)
             MqttsnError.raiseIfReturnCode(r.returnCode)
 
     def subscribe(self, topic, qos=0):
         s = MessageSubscribe(topic=topic, qos=qos, topicType=0)
-        self._write(s)
-        r = self._read(waitfor=MessageSubAck, msgId=s.msgId)
+        r = self._write_read(s)
         if r.topicId !=0:
             self.topicTable.add(topic, r.topicId)
             return r.topicId
 
     def unsubscribe(self, topic):
         s = MessageUnsubscribe(topic=topic, topicType=0)
-        self._write(s)
-        r = self._read(waitfor=MessageUnsubAck, msgId=s.msgId)
+        r = self._write_read(s)
 
-    def disconnect(self):
+    def disconnect(self, duration=None):
         if self.state != "Disconnected":
-            s = MessageDisconnect()
-            self._write(s)
-            self.state == "Disconnected"
+            s = MessageDisconnect(duration)
+            self._write_read(s)
+            self.state = "Disconnected"
 
     def __del__(self):
-        self.disconnect()
-
+        #self.disconnect()
+        pass

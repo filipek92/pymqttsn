@@ -1,5 +1,7 @@
 from bidict import bidict
 from paho.mqtt.client import topic_matches_sub
+from collections import namedtuple
+from threading import Event
 
 class TopicTable(bidict):
     def __init__(self, *args, **kwargs):
@@ -47,10 +49,37 @@ class TopicTable(bidict):
     def ids(self):
         return self
 
-class SubscriptionList(set):
-    def forTopic(self, topic):
-        return filter(lambda sub: self.matchTopic(topic, sub), self)
+class WaitingKey(namedtuple('WaitingKey', ['address', 'type', 'msgId'])):
+    def __repr__(self):
+        if self.msgId is not None:
+            return "{}(address={}, type={}, msgId={})".format(self.__class__.__name__, self.address, self.type.__name__, self.msgId)
+        else:
+            return "{}(address={}, type={})".format(self.__class__.__name__, self.address, self.type.__name__)
 
-    @staticmethod
-    def matchTopic(topic, subscription):
-        return topic_matches_sub(subscription, topic)      
+
+class WaitingEvent(Event):
+    """docstring for Waiting key"""
+    def __init__(self):
+        Event.__init__(self)
+        self.reply = None
+
+    def setReply(self, reply):
+        self.reply = reply
+        self.set()
+
+    def __repr__(self):
+        return "{}(reply={}, is_set={})".format(self.__class__.__name__, self.reply, self.is_set())
+
+class WaitingList(dict):
+    def add_waiting(self, address, waitfor, msgId=None, retry=None):
+        key = WaitingKey(address=address, type=waitfor, msgId=msgId)
+        event = WaitingEvent()
+        self[key] = event
+        return event
+
+    def get_waiting(self, address, type, msgId=None):
+        key = WaitingKey(address=address, type=type, msgId=msgId)
+        if key in self:
+            return self.pop(key)
+        return None        
+        
