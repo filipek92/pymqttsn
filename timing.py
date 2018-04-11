@@ -6,7 +6,40 @@ import sched
 import logging
 logger = logging.getLogger(__name__)
 
-class Scheduler(sched.scheduler):    
+class RepeatedEvent():
+    def __init__(self, scheduler, period, priority, action, argument=(), kwargs={}):
+        self.scheduler = scheduler
+        self.period = period
+        self.priority = priority
+        self.action = action
+        self.args = argument
+        self.kwargs = kwargs
+        self.event = self.scheduler.enter(self.period, self.priority, self.reschedule)
+
+
+    def cancel(self):
+        if self.event is not None:
+            self.scheduler.cancel(self.event)
+            self.lastcall = None
+            self.event = None
+
+    def reschedule(self):
+        self.event = self.scheduler.enter(self.period, self.priority, self.reschedule)
+        self.action(*self.args, **self.kwargs)
+
+    def __repr__(self):
+        return "{}(next={}, action={}, args={}, kwargs={})".format(
+            self.__class__.__name__,
+            self.event.time if self.event else None,
+            self.action.__name__,
+            self.args,
+            self.kwargs
+            )
+
+class Scheduler(sched.scheduler):
+    def enter_repeated(self, period, priority, action, argument=(), kwargs={}):
+        return RepeatedEvent(self, period, priority, action, argument, kwargs)
+
     def __repr__(self):
         return "{}(len(queue)={})".format(
                 self.__class__.__name__,
@@ -66,7 +99,7 @@ class ThreadScheduler(Scheduler):
             )
 
 if __name__ == '__main__':
-    s = Scheduler()
+    s = ThreadScheduler()
 
     import threading
     import code

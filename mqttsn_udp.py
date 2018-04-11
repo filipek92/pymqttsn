@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
 
-from pymqttsn.gateway import TransparentGateway
-from pymqttsn.client import Client
+from pymqttsn import TransparentGateway
+from pymqttsn import Client
 import socket
 import click
 import logging
 
 UDP_DEFAULT_PORT = 5476
 
-class UdpBase(socket.socket):
+class UdpBase:
     def __init__(self, host="0.0.0.0", port=UDP_DEFAULT_PORT, bind=False):
         self.server_addr = (socket.gethostbyname(host), port)
-        socket.socket.__init__(self, socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if bind:
-            self.bind(self.server_addr)
+            self.socket.bind(self.server_addr)
 
     def read_packet(self):
-        data, addr = self.recvfrom(1024)
+        data, addr = self.socket.recvfrom(1024)
         return data, addr
 
     def write_packet(self, data, addr=None):
         if addr is None:
-            return self.sendto(data, self.server_addr)
+            return self.socket.sendto(data, self.server_addr)
         else:
-            return self.sendto(data, addr)
+            return self.socket.sendto(data, addr)
 
     def broadcast_packet(self, data, radius=None):
-        return self.sendto(data, ('255.255.255.255', self.server_addr[1]))
+        return self.socket.sendto(data, ('255.255.255.255', self.server_addr[1]))
 
     def __del__(self):
-        self.close()
+        self.socket.close()
 
 class UdpGateway(TransparentGateway, UdpBase):
     def __init__(self, udpPort, udpIp="0.0.0.0", mqttHost="localhost", mqttPort=1883):
@@ -98,9 +98,10 @@ def main():
 @click.option('-p', '--port', default=UDP_DEFAULT_PORT)
 @click.option('-r', '--register-callback', is_flag=True, default=False)
 @click.option('-w', '--will', is_flag=True, default=False) 
-def client(client_id, clean, host, port, register_callback, will):
+@click.option("-k", '--keepalive', default=20)
+def client(client_id, clean, host, port, register_callback, will, keepalive):
     c = UdpClient(client_id, host=host, port=port)
-    c.connect(clean=clean, will=will)
+    c.connect(clean=clean, will=will, keepalive=keepalive)
 
     if register_callback:
         c.onMessage = onMessage
@@ -165,5 +166,9 @@ def adv_test():
         print(msg)
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s:%(name)s:%(levelname)s: %(message)s",
+        datefmt='%d.%m.%y %H:%M:%S'
+        )
     main()

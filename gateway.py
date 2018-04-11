@@ -9,12 +9,11 @@ from json import dumps, loads
 
 import paho.mqtt.client as mqtt
 import socket
+import time
 
 logger = logging.getLogger(__name__)
 
 class Gateway():
-    # scheduler = None
-
     def __init__(self, enable_advertising, gwId):
         self.T_ADV = 15*60 if enable_advertising else None# 15 minutes
         self.N_ADV = 3 if enable_advertising else 0
@@ -24,20 +23,18 @@ class Gateway():
         self.T_RETRY = 10
         self.N_RETRY = 5
         self.gwId = gwId
-        # if Gateway.scheduler is None:
-        #     Gateway.scheduler = ThreadScheduler()
-    #     if self.T_ADV is not None and self.N_ADV > 0:
-    #         logger.info("Advertising enabled")
-    #         self.advertising(True)
 
-    # def advertising(self, reschedule=False):
-    #     if reschedule:
-    #         for i in range(self.N_ADV):
-    #             self.scheduler.enter(self.T_ADV+i, 10, self.advertising, (i==0,))
+        self.scheduler = ThreadScheduler()
 
-    #     m = MessageAdvertise(self.gwId, self.T_ADV)
+        if enable_advertising:
+            logger.info("Advertising enabled")
+            self.scheduler.enter_repeated(self.T_ADV, 10, self.advertise)
 
-    #     self.broadcast_packet(bytes(m))
+    def advertise(self):
+        m = MessageAdvertise(self.gwId, self.T_ADV)
+        for i in range(self.N_ADV-1):
+            self.scheduler.enter(i+1, 11, self.broadcast_packet, (m,))
+        self.broadcast_packet(bytes(m))
 
     def read_packet(self):
         raise RuntimeError("Subclasses of pymqttsn.Gateway must implement method read_packet(), which class {} doesnt".format(self.__class__.__name__))
@@ -60,15 +57,12 @@ class TransparentGatewayClient(mqtt.Client):
         self.gateway = gateway
         self.logger = logger.getChild(clientId)
         self.messages = Queue() 
+        self.keepalive = 0
 
 
     def mqttOnMessage(self, client, userdata, msg):
         try:
-            self.logger.info("Received message {} on topic '{}' with QoS {}".format(
-                msg.payload,
-                msg.topic,
-                msg.qos
-            ))
+            self.logger.debug("Data {} on '{}'".format(msg.payload, msg.topic))
 
             topicId = self.topicTable.getTopicId(msg.topic)
             if topicId is None:
@@ -89,10 +83,11 @@ class TransparentGatewayClient(mqtt.Client):
             self.logger.exception(e)
 
     def __repr__(self):
-        return "{}(clientId='{}', addr={})".format(
+        return "{}(clientId='{}', addr={}, keepalive={})".format(
                 self.__class__.__name__,
                 self.clientId,
-                self.addr
+                self.addr,
+                self.keepalive
             )
 
     def handle_packet(self, m):
@@ -107,10 +102,9 @@ class TransparentGatewayClient(mqtt.Client):
             return callback(m)
         return None
 
-    def subscribe(self, topic, qos=0):
-        result, mid = mqtt.Client.subscribe(self, topic, qos)
-        self.logger.info("Subscribing topic '{}' with result {}".format(topic, result))
-        return result, mid
+    # def subscribe(self, topic, qos=0):
+    #     result, mid = mqtt.Client.subscribe(self, topic, qos)
+    #     return result, mid
 
 
     def getTopicById(self, topicId, topicType=0b00):
@@ -143,6 +137,8 @@ class TransparentGatewayClient(mqtt.Client):
         if m.flags.qos > 1:
             return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=3) # TODO Support QoS 2
 
+        self.logger.debug("Publishing to topic '{}'".format(topic))
+
         info = self.publish(topic=topic, payload=m.data, qos=m.flags.qos, retain=m.flags.retain)
         if m.flags.qos != 0:
             info.wait_for_publish()
@@ -158,6 +154,8 @@ class TransparentGatewayClient(mqtt.Client):
         if topic not in self.topicTable.topics:       
             self.topicTable.add(topic)
 
+        self.logger.info("Subscribing topic '{}'".format(topic))
+
         result, mid = self.subscribe(topic, m.flags.qos)
         if ("+" in topic) or ("#" in topic): # Topic has wildcart
             topicId = 0
@@ -172,11 +170,19 @@ class TransparentGatewayClient(mqtt.Client):
         else:
             topic = m.topic
 
+        self.logger.info("Unsubscribing topic '{}'".format(topic))
+
         result, mid = self.unsubscribe(topic)
         return MessageUnsubAck(msgId=m.msgId)
 
     def onPingReq(self, m):
-        pass
+        self.last_ping = time.monotonic()
+        self.logger.debug("Ping")
+        return m.getReplyType()()
+
+    @property
+    def ping_age(self):
+        return time.monotonic() - self.last_ping
 
     def __del__(self):
         self.disconnect()
@@ -228,26 +234,33 @@ class TransparentGateway(Gateway):
         packet = bytes(msg)
         return self.write_packet(packet, msg.addr)
 
+    def handle_msg(self, msg):
+        if type(msg) is MessageConnect:
+            return self.onConnect(msg)
+        if type(msg) is MessageDisconnect:
+            return self.onDisconnect(msg)
+
+        client = self.clients.get(msg.addr)
+        if client:
+            return client.handle_packet(msg)
+
+        if type(msg) is MessagePingReq:
+            return MessagePingResp()
+
+        replyType = msg.getReplyType()
+        reply = replyType()
+        if hasattr(reply, "returnCode"):
+            reply.returnCode = 0xFE
+        if hasattr(msg, "msgId") and hasattr(reply, "msgId"):
+            reply.msgId = msg.msgId
+        return reply
+
     def loop(self):
         logger.info("Gateway started")
         while not self._stopEvent.is_set():
             try:
                 msg = self._read()
-                if type(msg) is MessageConnect:
-                    reply = self.onConnect(msg)
-                elif type(msg) is MessageDisconnect:
-                    reply = self.onDisconnect(msg)
-                else:
-                    client = self.clients.get(msg.addr)
-                    if client:
-                        reply = client.handle_packet(msg)
-                    else:
-                        replyType = msg.getReplyType()
-                        reply = replyType()
-                        if hasattr(reply, "returnCode"):
-                            reply.returnCode = 0xFE
-                        if hasattr(msg, "msgId") and hasattr(reply, "msgId"):
-                            reply.msgId = msg.msgId
+                reply = self.handle_msg(msg)
             except KeyboardInterrupt:
                 break
             except Exception as e:
@@ -276,6 +289,7 @@ class TransparentGateway(Gateway):
     def onConnect(self, m):
         clean = m.flags.clean
         will = m.flags.will
+        keepalive = m.duration
 
         if will:
             return MessageConnAck(3)
@@ -300,7 +314,8 @@ class TransparentGateway(Gateway):
                     s.addr = client.addr
                     self._write(s)
                     #self._read(waitfor=MessageRegAck, msgId=s.msgId)
-
+            client.keepalive = keepalive
+            logger.info("Client connected {}".format(client))
             self.clients.addClient(m.addr, client)
             return MessageConnAck(0)
         except socket.gaierror as e:
@@ -314,7 +329,8 @@ class TransparentGateway(Gateway):
         if m.duration is not None:
             raise NotImplementedError("Support for sleeping clients not implemented")
         if m.addr in self.clients:
-            self.clients.deleteClient(m.addr)
+            cl = self.clients.deleteClient(m.addr)
+            logger.info("Client disconnected '{}'".format(cl))
         return m
 
 class ClientList(dict):
@@ -339,4 +355,4 @@ class ClientList(dict):
         return self[addr]
 
     def deleteClient(self, addr):
-        self.pop(addr)
+        return self.pop(addr)

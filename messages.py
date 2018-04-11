@@ -237,8 +237,6 @@ class MessageAdvertise(Message):
         else:
             return "{}(duration='{}')".format(self.__class__.__name__, self.duration)
 
-        
-
 class MessageConnect(MessageReq):
     typeId = 0x04
 
@@ -574,15 +572,15 @@ class MessagePingReq(MessageReq):
     def __init__(self, clientId=None):
         MessageReq.__init__(self)
         if clientId is None:
-            clientId = bytes()
+            clientId = ""
         self.clientId = clientId
 
     def pack(self):
-        return self.clientId
-
+        return self.clientId.encode("utf-8")
+        
     @classmethod
     def unpack(cls, binary):
-        return cls(binary)
+        return cls(binary.decode("utf-8"))
 
     def __repr__(self):
         if len(self.clientId) == 0:

@@ -1,9 +1,11 @@
+import logging
+from threading import Thread, Event
+
 from .messages import *
 from .exceptions import MqttsnError
 from .tools import TopicTable, WaitingList
-from threading import Thread, Event
+from .timing import ThreadScheduler
 
-import logging
 logger = logging.getLogger(__name__)
 
 class Client():
@@ -18,8 +20,12 @@ class Client():
         self.waitingList = WaitingList()
         self.thread = None
         self.stop_event = Event()
+        self.keepalive = 0
         if startThread:
             self.start()
+
+        self.scheduler = ThreadScheduler()
+        self.events = {'ping': None}
 
     def start(self):
         if self.thread is None:
@@ -45,27 +51,6 @@ class Client():
                 self.handle_message(msg)
             except Exception as e:
                 logging.exception(e)
-
-    def onPublish(self, msg):
-        msg.topic = self.topicTable.getTopic(msg.topicId)
-        # TODU Ask if unknown
-
-        # if topic is None:
-        #     return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=2)
-
-        if self.onMessage:
-            self.onMessage(msg)
-        else:
-            logger.info(msg)
-
-    def onRegister(self, msg):
-        self.topicTable.add(topic=msg.topicName, id=msg.topicId)
-        logger.info("New topic registered: {} ==> {}".format(msg.topicName, msg.topicId))
-        s = MessageRegAck(
-            msgId=msg.msgId,
-            returnCode=0,
-            topicId=msg.topicId)
-        self._write(s)
 
     def _write_read(self, msg, retry=None):
         we = self.waitingList.add_waiting(
@@ -98,11 +83,14 @@ class Client():
         if callback:
             callback(msg)
 
-    def connect(self, will=False, clean=False):
-        s = MessageConnect(self.clientId, will=will, clean=clean, duration=0)
+    def connect(self, will=False, clean=False, keepalive=600):
+        self.keepalive = keepalive
+        s = MessageConnect(self.clientId, will=will, clean=clean, duration=keepalive)
         r = self._write_read(s)
         MqttsnError.raiseIfReturnCode(r.returnCode)
+        logger.info("Connected to server")
         self.state = "Connected"
+        self.events["ping"] = self.scheduler.enter_repeated(keepalive*0.75, 10, self.ping)
 
     def register(self, topic):
         s = MessageRegister(topicName=topic)
@@ -151,6 +139,39 @@ class Client():
             s = MessageDisconnect(duration)
             self._write_read(s)
             self.state = "Disconnected"
+            self.events["ping"].cancel()
+            self.events["ping"] = None
+
+    def ping(self):
+        s = MessagePingReq(clientId=self.clientId if self.state != "Connected" else None)
+        try:
+            r = self._write_read(s)
+        except TimeoutError:
+            logger.info("Connection to server lost")
+            self.state = "Disconnected"
+            self.events["ping"].cancel()
+            self.events["ping"] = None
+
+    def onPublish(self, msg):
+        msg.topic = self.topicTable.getTopic(msg.topicId)
+        # TODO Ask if unknown
+
+        # if topic is None:
+        #     return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=2)
+
+        if self.onMessage:
+            self.onMessage(msg)
+        else:
+            logger.info(msg)
+
+    def onRegister(self, msg):
+        self.topicTable.add(topic=msg.topicName, id=msg.topicId)
+        logger.info("New topic registered: {} ==> {}".format(msg.topicName, msg.topicId))
+        s = MessageRegAck(
+            msgId=msg.msgId,
+            returnCode=0,
+            topicId=msg.topicId)
+        self._write(s)
 
     def __del__(self):
         #self.disconnect()
