@@ -12,7 +12,8 @@ class Client():
     T_RETRY = 10
     N_RETRY = 5
 
-    def __init__(self, clientId, startThread=True):
+    def __init__(self, phy, clientId, startThread=True):
+        self.phy = phy
         self.clientId = clientId
         self.state = "Disconnected"
         self.topicTable = TopicTable()
@@ -39,7 +40,7 @@ class Client():
     def loop(self):
         while not self.stop_event.is_set():
             try:
-                data, addr = self.read_packet()
+                data, addr = self.phy.read_packet()
                 msg = Message.fromBinary(data)
                 logger.debug("Read: {}".format(msg))
                 msgId = msg.msgId if hasattr(msg, "msgId") else None
@@ -54,7 +55,7 @@ class Client():
 
     def _write_read(self, msg, retry=None):
         we = self.waitingList.add_waiting(
-            address=self.server_addr,
+            address=self.phy.server_addr,
             waitfor=msg.getReplyType(), 
             msgId=msg.msgId if hasattr(msg, "msgId") else None
         )
@@ -73,7 +74,7 @@ class Client():
 
     def _write(self, msg):
         logger.debug("Write: {}".format(msg))
-        return self.write_packet(bytes(msg))
+        return self.phy.write_packet(bytes(msg))
 
     def handle_message(self, msg):
         callback = {

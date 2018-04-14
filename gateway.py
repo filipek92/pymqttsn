@@ -14,7 +14,8 @@ import time
 logger = logging.getLogger(__name__)
 
 class Gateway():
-    def __init__(self, enable_advertising, gwId):
+    def __init__(self, phy, enable_advertising, gwId):
+        self.phy = phy
         self.T_ADV = 15*60 if enable_advertising else None# 15 minutes
         self.N_ADV = 3 if enable_advertising else 0
         self.T_SEARCH_GWINFO = 5
@@ -36,28 +37,24 @@ class Gateway():
             self.scheduler.enter(i+1, 11, self.broadcast_packet, (m,))
         self.broadcast_packet(bytes(m))
 
-    def read_packet(self):
-        raise RuntimeError("Subclasses of pymqttsn.Gateway must implement method read_packet(), which class {} doesnt".format(self.__class__.__name__))
-
-    def write_packet(self, data, addr=None):
-        raise RuntimeError("Subclasses of pymqttsn.Gateway must implement method write_packet(data, addr), which class {} doesnt".format(self.__class__.__name__))
-
-    def broadcast_packet(self, data, radius=None):
-        raise RuntimeError("Subclasses of pymqttsn.Gateway must implement method write_packet_broadcast(data, addr), which class {} doesnt".format(self.__class__.__name__))
-
-class TransparentGatewayClient(mqtt.Client):
+class TransparentGatewayClient():
     def __init__(self, clientId, addr, mqttHost, mqttPort, gateway):
-        mqtt.Client.__init__(self)
+        self.mqttClient = mqtt.Client(client_id=clientId)
         self.clientId = clientId
         self.addr = addr
         self.topicTable = TopicTable()
-        self.on_message = self.mqttOnMessage
-        self.loop_start()
-        self.connect(mqttHost, mqttPort)
+        self.mqttClient.on_message = self.mqttOnMessage
+        # self.mqttClient.on_connect = lambda client, userdata, flags, rc: print("Connect for {}".format(clientId))
+        # self.mqttClient.on_disconnect = lambda client, userdata, rc: print("Disconnect for {}".format(clientId))
+        self.mqttClient.loop_start()
+        self.mqttHost = mqttHost
+        self.mqttPort = mqttPort
         self.gateway = gateway
-        self.logger = logger.getChild(clientId)
-        self.messages = Queue() 
+        self.logger = logger.getChild(clientId, )
+        self.messages = Queue(100) 
         self.keepalive = 0
+        self.sleeping = False
+        self.messageQueue = Queue() 
 
 
     def mqttOnMessage(self, client, userdata, msg):
@@ -69,7 +66,10 @@ class TransparentGatewayClient(mqtt.Client):
                 topicId = self.topicTable.add(msg.topic)
                 m = MessageRegister(topicName=msg.topic, msgId=Message.newMessageId(), topicId=topicId)
                 m.addr = self.addr
-                self.gateway._write(m)
+                if not self.sleeping:
+                    self.gateway._write(m)
+                else:
+                    self.messageQueue.put(m)
 
             m = MessagePublish(
                 msgId=Message.newMessageId(),
@@ -78,16 +78,20 @@ class TransparentGatewayClient(mqtt.Client):
                 retain=msg.retain,
                 qos=msg.qos)
             m.addr = self.addr
-            self.gateway._write(m)
+            if not self.sleeping:
+                self.gateway._write(m)
+            else:
+                self.messageQueue.put(m)
         except Exception as e:
             self.logger.exception(e)
 
     def __repr__(self):
-        return "{}(clientId='{}', addr={}, keepalive={})".format(
+        return "{}(clientId='{}', addr={}, keepalive={}, sleeping={})".format(
                 self.__class__.__name__,
                 self.clientId,
                 self.addr,
-                self.keepalive
+                self.keepalive,
+                self.sleeping
             )
 
     def handle_packet(self, m):
@@ -119,6 +123,14 @@ class TransparentGatewayClient(mqtt.Client):
         else:
             raise ValueError("Topic type must be 2-bit number")
 
+    def onConnect(self, clean=True, will=False):
+        self.mqttClient._clean_session = clean
+        self.mqttClient.connect(self.mqttHost, self.mqttPort)
+        self.refreshTopicMap()
+        self.sendQueue()
+
+    def onDisconnect(self):
+        self.mqttClient.disconnect()
 
     def onRegister(self, m):
         if not m.topicName in self.topicTable.topics:
@@ -139,7 +151,7 @@ class TransparentGatewayClient(mqtt.Client):
 
         self.logger.debug("Publishing to topic '{}'".format(topic))
 
-        info = self.publish(topic=topic, payload=m.data, qos=m.flags.qos, retain=m.flags.retain)
+        info = self.mqttClient.publish(topic=topic, payload=m.data, qos=m.flags.qos, retain=m.flags.retain)
         if m.flags.qos != 0:
             info.wait_for_publish()
             return MessagePubAck(msgId=m.msgId, topicId=m.topicId, returnCode=info.rc)
@@ -156,7 +168,7 @@ class TransparentGatewayClient(mqtt.Client):
 
         self.logger.info("Subscribing topic '{}'".format(topic))
 
-        result, mid = self.subscribe(topic, m.flags.qos)
+        result, mid = self.mqttClient.subscribe(topic, m.flags.qos)
         if ("+" in topic) or ("#" in topic): # Topic has wildcart
             topicId = 0
         else:
@@ -172,26 +184,40 @@ class TransparentGatewayClient(mqtt.Client):
 
         self.logger.info("Unsubscribing topic '{}'".format(topic))
 
-        result, mid = self.unsubscribe(topic)
+        result, mid = self.mqttClient.unsubscribe(topic)
         return MessageUnsubAck(msgId=m.msgId)
 
     def onPingReq(self, m):
         self.last_ping = time.monotonic()
         self.logger.debug("Ping")
-        return m.getReplyType()()
+        if self.sleeping:
+            self.sendQueue()
+        replyType = m.getReplyType() 
+        return replyType()
+
+    def sendQueue(self):
+        while not self.messageQueue.empty():
+            self.gateway._write(self.messageQueue.get())
+
+    def refreshTopicMap(self):
+        for topicId, topic in self.topicTable.items():
+            s = MessageRegister(topicName=topic, msgId=Message.newMessageId(), topicId=topicId)
+            s.addr = self.addr
+            self.gateway._write(s)
 
     @property
     def ping_age(self):
         return time.monotonic() - self.last_ping
 
     def __del__(self):
-        self.disconnect()
-        self.loop_stop()
+        self.mqttClient.disconnect()
+        self.mqttClient.loop_stop()
 
 class TransparentGateway(Gateway):
-    def __init__(self, host="localhost", port=1883, enable_advertising=True, gwId=0):
-        Gateway.__init__(self, enable_advertising=enable_advertising, gwId=0)
+    def __init__(self, phy, host="localhost", port=1883, enable_advertising=True, gwId=0):
+        Gateway.__init__(self, phy=phy, enable_advertising=enable_advertising, gwId=0)
         self.clients = ClientList()
+        self.sleepingClients = ClientList()
         self._stopEvent = Event()
 
         self.mqttHost = host
@@ -223,7 +249,7 @@ class TransparentGateway(Gateway):
             print("  {}: {}".format(addr, self.clients[addr]))
 
     def _read(self):
-        data, addr = self.read_packet()
+        data, addr = self.phy.read_packet()
         msg = Message.fromBinary(data)
         msg.addr = addr
         logger.debug("Read: {}".format(msg))
@@ -232,7 +258,7 @@ class TransparentGateway(Gateway):
     def _write(self, msg):
         logger.debug("Write: {}".format(msg))
         packet = bytes(msg)
-        return self.write_packet(packet, msg.addr)
+        return self.phy.write_packet(packet, msg.addr)
 
     def handle_msg(self, msg):
         if type(msg) is MessageConnect:
@@ -245,7 +271,9 @@ class TransparentGateway(Gateway):
             return client.handle_packet(msg)
 
         if type(msg) is MessagePingReq:
-            return MessagePingResp()
+            client = self.sleepingClients.getClientById(msg.clientId)
+            if client:
+                return client.onPingReq(msg)
 
         replyType = msg.getReplyType()
         reply = replyType()
@@ -298,6 +326,16 @@ class TransparentGateway(Gateway):
             cl = self.clients.popById(m.clientId)
 
         try:
+            client = self.sleepingClients.popById(m.clientId)
+            if client is not None:
+                client.keepalive = keepalive
+                client.sleeping = False
+                client.addr = m.addr
+                client.onConnect(clean=clean, will=will, mqttConnect=False)
+                client.logger.info("Sleeping client connected {}".format(client))
+                self.clients.addClient(m.addr, client)
+                return MessageConnAck(0)
+
             client = self.clients.popById(m.clientId)
             if client is None:
                 client = TransparentGatewayClient(
@@ -306,18 +344,16 @@ class TransparentGateway(Gateway):
                     self.mqttHost, 
                     self.mqttPort, 
                     gateway=self)
+                client.logger.info("New client connected {}".format(client))
             else:
-                client.addr = m.addr
-                #Resend all topic maps
-                for topicId, topic in client.topicTable.items():
-                    s = MessageRegister(topicName=topic, msgId=Message.newMessageId(), topicId=topicId)
-                    s.addr = client.addr
-                    self._write(s)
-                    #self._read(waitfor=MessageRegAck, msgId=s.msgId)
+                client.logger.info("Client reconnected")
             client.keepalive = keepalive
-            logger.info("Client connected {}".format(client))
+            client.addr = m.addr
+            client.sleeping = False
+            client.onConnect(clean = clean, will=will)
             self.clients.addClient(m.addr, client)
             return MessageConnAck(0)
+
         except socket.gaierror as e:
             logger.exception(e)
             return MessageConnAck(0xfd)
@@ -326,11 +362,16 @@ class TransparentGateway(Gateway):
         return MessageConnAck(255)
 
     def onDisconnect(self, m):
-        if m.duration is not None:
-            raise NotImplementedError("Support for sleeping clients not implemented")
         if m.addr in self.clients:
             cl = self.clients.deleteClient(m.addr)
-            logger.info("Client disconnected '{}'".format(cl))
+            if m.duration is None:
+                logger.info("Client disconnected '{}'".format(cl))
+                cl.onDisconnect()
+            else:
+                cl.sleeping = True
+                cl.keepalive = m.duration
+                self.sleepingClients.addClient(m.addr, cl)
+                logger.info("Client made sleeping")
         return m
 
 class ClientList(dict):

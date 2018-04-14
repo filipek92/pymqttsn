@@ -104,7 +104,7 @@ class Message:
         for cls in Message.listTypes():
             if cls.typeId == typeId:
                 return cls
-        raise ValueError("Unknown message type")
+        raise ValueError("Unknown message type {0} (0x{0:02x}".format(typeId))
 
 class MessageReq(Message):
     def __init__(self):
@@ -577,7 +577,7 @@ class MessagePingReq(MessageReq):
 
     def pack(self):
         return self.clientId.encode("utf-8")
-        
+
     @classmethod
     def unpack(cls, binary):
         return cls(binary.decode("utf-8"))
@@ -630,4 +630,4 @@ class MessageDisconnect(MessageReq):
         if self.duration is None:
             return "{}()".format(self.__class__.__name__)
         else:
-            return "{}(duration='{}')".format(self.__class__.__name__, self.duration)        
+            return "{}(duration={})".format(self.__class__.__name__, self.duration)        

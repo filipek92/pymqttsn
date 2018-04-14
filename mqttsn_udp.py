@@ -31,55 +31,36 @@ class UdpBase:
     def __del__(self):
         self.socket.close()
 
-class UdpGateway(TransparentGateway, UdpBase):
+class UdpGateway(TransparentGateway):
     def __init__(self, udpPort, udpIp="0.0.0.0", mqttHost="localhost", mqttPort=1883):
-        UdpBase.__init__(self, host=udpIp, port=udpPort, bind=True)
-        TransparentGateway.__init__(self, host=mqttHost, port=mqttPort, enable_advertising=False)
-
-    def read_packet(self):
-        return UdpBase.read_packet(self)
-
-    def write_packet(self, data, addr=None):
-        return UdpBase.write_packet(self, data, addr)
-
-    def broadcast_packet(self, data, radius=None):
-        return UdpBase.write_packet(self, data, radius)
+        phy = UdpBase(host=udpIp, port=udpPort, bind=True)
+        TransparentGateway.__init__(self, phy=phy, host=mqttHost, port=mqttPort, enable_advertising=False)
 
     def __repr__(self):
         return "{}(udpIp={}, udpPort={}, mqttHost={}, mqttPort={})".format(
                 self.__class__.__name__,
-                self.server_addr[0],
-                self.server_addr[1],
+                self.phy.server_addr[0],
+                self.phy.server_addr[1],
                 self.mqttHost,
                 self.mqttPort
             )
      
-class UdpClient(Client, UdpBase):
+class UdpClient(Client):
     T_RETRY = 2
     N_RETRY = 5
     
     def __init__(self, clientId, host="127.0.0.1", port=UDP_DEFAULT_PORT):
-        UdpBase.__init__(self, port=port, host=host)
-        Client.__init__(self, clientId=clientId)
+        phy = UdpBase(port=port, host=host)
+        Client.__init__(self, phy=phy,  clientId=clientId)
 
     def __del__(self):
         Client.__del__(self)
-        UdpBase.__del__(self)
-
-    def read_packet(self):
-        return UdpBase.read_packet(self)
-
-    def write_packet(self, data, addr=None):
-        return UdpBase.write_packet(self, data, addr)
-
-    def write_packet_broadcast(self, data, radius):
-        return UdpBase.write_packet(self, data, radius)
 
     def __repr__(self):
         return "{}(serverIp={}, serverPort={}, clientId={}, state={})".format(
                 self.__class__.__name__,
-                self.server_addr[0],
-                self.server_addr[1],
+                self.phy.server_addr[0],
+                self.phy.server_addr[1],
                 self.clientId,
                 self.state
             ) 
@@ -167,7 +148,7 @@ def adv_test():
 
 if __name__ == '__main__':
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s:%(name)s:%(levelname)s: %(message)s",
         datefmt='%d.%m.%y %H:%M:%S'
         )
